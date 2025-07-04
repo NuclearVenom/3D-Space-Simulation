@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Endless Space Explorer</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: black;
+            overflow: hidden;
+            font-family: Arial, sans-serif;
+        }
+        
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            font-size: 14px;
+            z-index: 100;
+            background: rgba(0,0,0,0.7);
+            padding: 10px;
+            border-radius: 5px;
+        }
+        
+        #crosshair {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 4px;
+            height: 4px;
+            background: white;
+            border-radius: 50%;
+            z-index: 50;
+        }
+        
+        canvas {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">
+        Use WASD to move, SPACE to jump, mouse to look around<br>
+        Click to lock cursor for better control
+    </div>
+    <div id="crosshair"></div>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+        // ==================== CONFIGURATION PARAMETERS ====================
+        const CONFIG = {
+            // Movement
+            MOVE_SPEED: 0.15,
+            JUMP_FORCE: 0.3,
+            GRAVITY: 0.01,
+            
+            // Camera
+            MOUSE_SENSITIVITY: 0.005,
+            CAMERA_HEIGHT: 1.8,
+            
+            // World
+            WORLD_SIZE: 200,
+            CHUNK_SIZE: 50,
+            OBSTACLE_DENSITY: 0.005, // obstacles per unit area
+            
+            // Obstacles
+            OBSTACLE_MIN_SIZE: { width: 1, height: 1, depth: 1 },
+            OBSTACLE_MAX_SIZE: { width: 2, height: 2, depth: 2 },
+            
+            // Lighting
+            LIGHT_INTENSITY: 1.2,
+            LIGHT_HEIGHT: 20,
+            AMBIENT_LIGHT: 0.1,
+            
+            // Sky
+            STAR_COUNT: 1200,
+            STAR_SIZE: 0.1
+        };
+        
+        // ==================== GAME STATE ====================
+        class GameState {
+            constructor() {
+                this.keys = {};
+                this.player = { 
+                    x: 0, y: CONFIG.CAMERA_HEIGHT, z: 0,
+                    velY: 0, onGround: false 
+                };
+                this.chunks = new Map();
+                this.obstacles = [];
+            }
+        }
+        
+        // ==================== WORLD GENERATION ====================
+        class WorldGenerator {
+            static generateObstacles(chunkX, chunkZ, density) {
+                const obstacles = [];
+                const numObstacles = Math.floor(CONFIG.CHUNK_SIZE * CONFIG.CHUNK_SIZE * density);
+                
+                for (let i = 0; i < numObstacles; i++) {
+                    const x = chunkX * CONFIG.CHUNK_SIZE + Math.random() * CONFIG.CHUNK_SIZE;
+                    const z = chunkZ * CONFIG.CHUNK_SIZE + Math.random() * CONFIG.CHUNK_SIZE;
+                    
+                    const width = CONFIG.OBSTACLE_MIN_SIZE.width + 
+                                 Math.random() * (CONFIG.OBSTACLE_MAX_SIZE.width - CONFIG.OBSTACLE_MIN_SIZE.width);
+                    const height = CONFIG.OBSTACLE_MIN_SIZE.height + 
+                                  Math.random() * (CONFIG.OBSTACLE_MAX_SIZE.height - CONFIG.OBSTACLE_MIN_SIZE.height);
+                    const depth = CONFIG.OBSTACLE_MIN_SIZE.depth + 
+                                 Math.random() * (CONFIG.OBSTACLE_MAX_SIZE.depth - CONFIG.OBSTACLE_MIN_SIZE.depth);
+                    
+                    obstacles.push({
+                        x, z, width, height, depth,
+                        y: height / 2 // Center the obstacle on the ground
+                    });
+                }
+                
+                return obstacles;
+            }
+            
+            static generateStars(count) {
+                const stars = [];
+                for (let i = 0; i < count; i++) {
+                    stars.push({
+                        x: (Math.random() - 0.5) * 1000,
+                        y: Math.random() * 500 + 100,
+                        z: (Math.random() - 0.5) * 1000
+                    });
+                }
+                return stars;
+            }
+        }
+        
+        // ==================== PHYSICS ====================
+        class Physics {
+            static checkCollision(player, obstacle) {
+                const playerRadius = 0.5;
+                
+                return (
+                    player.x + playerRadius > obstacle.x - obstacle.width / 2 &&
+                    player.x - playerRadius < obstacle.x + obstacle.width / 2 &&
+                    player.y + CONFIG.CAMERA_HEIGHT > obstacle.y - obstacle.height / 2 &&
+                    player.y < obstacle.y + obstacle.height / 2 &&
+                    player.z + playerRadius > obstacle.z - obstacle.depth / 2 &&
+                    player.z - playerRadius < obstacle.z + obstacle.depth / 2
+                );
+            }
+            
+            static resolveCollision(player, obstacle) {
+                const playerRadius = 0.5;
+                const dx = player.x - obstacle.x;
+                const dz = player.z - obstacle.z;
+                
+                if (Math.abs(dx) > Math.abs(dz)) {
+                    player.x = obstacle.x + (dx > 0 ? obstacle.width / 2 + playerRadius : -obstacle.width / 2 - playerRadius);
+                } else {
+                    player.z = obstacle.z + (dz > 0 ? obstacle.depth / 2 + playerRadius : -obstacle.depth / 2 - playerRadius);
+                }
+            }
+        }
+        
+        // ==================== CUSTOM POINTER LOCK CONTROLS ====================
+        class CustomPointerLockControls {
+            constructor(camera, domElement) {
+                this.camera = camera;
+                this.domElement = domElement;
+                this.isLocked = false;
+                
+                this.pitchObject = new THREE.Object3D();
+                this.yawObject = new THREE.Object3D();
+                
+                this.pitchObject.add(camera);
+                this.yawObject.add(this.pitchObject);
+                
+                this.minPolarAngle = 0;
+                this.maxPolarAngle = Math.PI;
+                
+                this.sensitivity = CONFIG.MOUSE_SENSITIVITY;
+                
+                this.onMouseMove = this.onMouseMove.bind(this);
+            }
+            
+            onMouseMove(event) {
+                if (!this.isLocked) return;
+                
+                const movementX = event.movementX || event.mozMovementX || event.webkitMovementX || 0;
+                const movementY = event.movementY || event.mozMovementY || event.webkitMovementY || 0;
+                
+                this.yawObject.rotation.y -= movementX * this.sensitivity;
+                this.pitchObject.rotation.x -= movementY * this.sensitivity;
+                
+                this.pitchObject.rotation.x = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, this.pitchObject.rotation.x));
+            }
+            
+            lock() {
+                this.isLocked = true;
+                document.addEventListener('mousemove', this.onMouseMove, false);
+            }
+            
+            unlock() {
+                this.isLocked = false;
+                document.removeEventListener('mousemove', this.onMouseMove, false);
+            }
+            
+            getObject() {
+                return this.yawObject;
+            }
+            
+            getDirection() {
+                const direction = new THREE.Vector3(0, 0, -1);
+                direction.applyQuaternion(this.yawObject.quaternion);
+                return direction;
+            }
+            
+            setSensitivity(value) {
+                this.sensitivity = value;
+            }
+        }
+
+        // ==================== MAIN GAME CLASS ====================
+        class Game {
+            constructor() {
+                this.state = new GameState();
+                this.init();
+                this.setupEventListeners();
+                this.animate();
+            }
+            
+            init() {
+                // Scene setup
+                this.scene = new THREE.Scene();
+                this.camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+                this.renderer = new THREE.WebGLRenderer({ antialias: true });
+                this.renderer.setSize(window.innerWidth, window.innerHeight);
+                this.renderer.shadowMap.enabled = true;
+                this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+                document.body.appendChild(this.renderer.domElement);
+                
+                // Setup custom pointer lock controls
+                this.controls = new CustomPointerLockControls(this.camera, document.body);
+                this.scene.add(this.controls.getObject());
+                
+                // Position player at starting location
+                this.controls.getObject().position.set(0, CONFIG.CAMERA_HEIGHT, 0);
+                
+                // Ground
+                this.createGround();
+                
+                // Sky with stars
+                this.createSky();
+                
+                // Lighting
+                this.setupLighting();
+                
+                // Initial chunks
+                this.loadInitialChunks();
+            }
+            
+            createGround() {
+                const groundGeometry = new THREE.PlaneGeometry(CONFIG.WORLD_SIZE * 2, CONFIG.WORLD_SIZE * 2);
+                const groundMaterial = new THREE.MeshLambertMaterial({ 
+                    color: 0x333333,
+                    transparent: true,
+                    opacity: 0.8
+                });
+                this.ground = new THREE.Mesh(groundGeometry, groundMaterial);
+                this.ground.rotation.x = -Math.PI / 2;
+                this.ground.receiveShadow = true;
+                this.scene.add(this.ground);
+            }
+            
+            createSky() {
+                const stars = WorldGenerator.generateStars(CONFIG.STAR_COUNT);
+                const starGeometry = new THREE.BufferGeometry();
+                const starPositions = new Float32Array(stars.length * 3);
+                
+                stars.forEach((star, i) => {
+                    starPositions[i * 3] = star.x;
+                    starPositions[i * 3 + 1] = star.y;
+                    starPositions[i * 3 + 2] = star.z;
+                });
+                
+                starGeometry.setAttribute('position', new THREE.BufferAttribute(starPositions, 3));
+                const starMaterial = new THREE.PointsMaterial({ 
+                    color: 0xffffff, 
+                    size: CONFIG.STAR_SIZE 
+                });
+                this.stars = new THREE.Points(starGeometry, starMaterial);
+                this.scene.add(this.stars);
+            }
+            
+            setupLighting() {
+                // Ambient light
+                this.ambientLight = new THREE.AmbientLight(0x404040, CONFIG.AMBIENT_LIGHT);
+                this.scene.add(this.ambientLight);
+                
+                // Directional light (sun)
+                this.directionalLight = new THREE.DirectionalLight(0xffffff, CONFIG.LIGHT_INTENSITY);
+                this.directionalLight.position.set(50, CONFIG.LIGHT_HEIGHT, 50);
+                this.directionalLight.castShadow = true;
+                this.directionalLight.shadow.mapSize.width = 2048;
+                this.directionalLight.shadow.mapSize.height = 2048;
+                this.directionalLight.shadow.camera.near = 0.5;
+                this.directionalLight.shadow.camera.far = 200;
+                this.directionalLight.shadow.camera.left = -100;
+                this.directionalLight.shadow.camera.right = 100;
+                this.directionalLight.shadow.camera.top = 100;
+                this.directionalLight.shadow.camera.bottom = -100;
+                this.scene.add(this.directionalLight);
+                
+                // Point light following player
+                this.playerLight = new THREE.PointLight(0xffffff, 0.5, 20);
+                this.playerLight.position.set(0, CONFIG.CAMERA_HEIGHT, 0);
+                this.scene.add(this.playerLight);
+            }
+            
+            loadInitialChunks() {
+                for (let x = -2; x <= 2; x++) {
+                    for (let z = -2; z <= 2; z++) {
+                        this.loadChunk(x, z);
+                    }
+                }
+            }
+            
+            loadChunk(chunkX, chunkZ) {
+                const chunkKey = `${chunkX},${chunkZ}`;
+                if (this.state.chunks.has(chunkKey)) return;
+                
+                const obstacles = WorldGenerator.generateObstacles(chunkX, chunkZ, CONFIG.OBSTACLE_DENSITY);
+                const chunkGroup = new THREE.Group();
+                
+                obstacles.forEach(obstacle => {
+                    const geometry = new THREE.BoxGeometry(obstacle.width, obstacle.height, obstacle.depth);
+                    const material = new THREE.MeshLambertMaterial({ 
+                        color: new THREE.Color().setHSL(Math.random(), 0.5, 0.5) 
+                    });
+                    const mesh = new THREE.Mesh(geometry, material);
+                    mesh.position.set(obstacle.x, obstacle.y, obstacle.z);
+                    mesh.castShadow = true;
+                    mesh.receiveShadow = true;
+                    chunkGroup.add(mesh);
+                    
+                    this.state.obstacles.push(obstacle);
+                });
+                
+                this.state.chunks.set(chunkKey, { group: chunkGroup, obstacles });
+                this.scene.add(chunkGroup);
+            }
+            
+            unloadChunk(chunkX, chunkZ) {
+                const chunkKey = `${chunkX},${chunkZ}`;
+                const chunk = this.state.chunks.get(chunkKey);
+                if (!chunk) return;
+                
+                this.scene.remove(chunk.group);
+                chunk.obstacles.forEach(obstacle => {
+                    const index = this.state.obstacles.indexOf(obstacle);
+                    if (index > -1) this.state.obstacles.splice(index, 1);
+                });
+                this.state.chunks.delete(chunkKey);
+            }
+            
+            updateChunks() {
+                const playerChunkX = Math.floor(this.state.player.x / CONFIG.CHUNK_SIZE);
+                const playerChunkZ = Math.floor(this.state.player.z / CONFIG.CHUNK_SIZE);
+                const loadDistance = 3;
+                const unloadDistance = 5;
+                
+                // Load nearby chunks
+                for (let x = playerChunkX - loadDistance; x <= playerChunkX + loadDistance; x++) {
+                    for (let z = playerChunkZ - loadDistance; z <= playerChunkZ + loadDistance; z++) {
+                        this.loadChunk(x, z);
+                    }
+                }
+                
+                // Unload distant chunks
+                for (const [chunkKey, chunk] of this.state.chunks) {
+                    const [x, z] = chunkKey.split(',').map(Number);
+                    if (Math.abs(x - playerChunkX) > unloadDistance || 
+                        Math.abs(z - playerChunkZ) > unloadDistance) {
+                        this.unloadChunk(x, z);
+                    }
+                }
+            }
+            
+            setupEventListeners() {
+                // Keyboard events
+                document.addEventListener('keydown', (e) => {
+                    this.state.keys[e.code] = true;
+                });
+                
+                document.addEventListener('keyup', (e) => {
+                    this.state.keys[e.code] = false;
+                });
+                
+                // Pointer lock setup
+                this.renderer.domElement.addEventListener('click', () => {
+                    if (!this.controls.isLocked) {
+                        document.body.requestPointerLock();
+                    }
+                });
+                
+                const pointerLockChange = () => {
+                    if (document.pointerLockElement === document.body) {
+                        this.controls.lock();
+                    } else {
+                        this.controls.unlock();
+                    }
+                };
+                
+                document.addEventListener('pointerlockchange', pointerLockChange);
+                document.addEventListener('mozpointerlockchange', pointerLockChange);
+                document.addEventListener('webkitpointerlockchange', pointerLockChange);
+                
+                // Window resize
+                window.addEventListener('resize', () => {
+                    this.camera.aspect = window.innerWidth / window.innerHeight;
+                    this.camera.updateProjectionMatrix();
+                    this.renderer.setSize(window.innerWidth, window.innerHeight);
+                });
+            }
+            
+            updatePlayer() {
+                if (!this.controls.isLocked) return;
+                
+                const player = this.state.player;
+                const keys = this.state.keys;
+                
+                // Calculate movement direction based on camera orientation
+                const forward = new THREE.Vector3();
+                forward.setFromMatrixColumn(this.controls.getObject().matrix, 0);
+                forward.crossVectors(this.controls.getObject().up, forward);
+                
+                const right = new THREE.Vector3();
+                right.setFromMatrixColumn(this.controls.getObject().matrix, 0);
+                
+                let moveX = 0, moveZ = 0;
+                
+                if (keys['KeyW']) { moveX += forward.x; moveZ += forward.z; }
+                if (keys['KeyS']) { moveX -= forward.x; moveZ -= forward.z; }
+                if (keys['KeyA']) { moveX -= right.x; moveZ -= right.z; }
+                if (keys['KeyD']) { moveX += right.x; moveZ += right.z; }
+                
+                // Normalize movement
+                const moveLength = Math.sqrt(moveX * moveX + moveZ * moveZ);
+                if (moveLength > 0) {
+                    moveX = (moveX / moveLength) * CONFIG.MOVE_SPEED;
+                    moveZ = (moveZ / moveLength) * CONFIG.MOVE_SPEED;
+                }
+                
+                // Apply movement with collision detection
+                const newX = player.x + moveX;
+                const newZ = player.z + moveZ;
+                
+                player.x = newX;
+                player.z = newZ;
+                
+                // Check collisions
+                this.state.obstacles.forEach(obstacle => {
+                    if (Physics.checkCollision(player, obstacle)) {
+                        Physics.resolveCollision(player, obstacle);
+                    }
+                });
+                
+                // Jump
+                if (keys['Space'] && player.onGround) {
+                    player.velY = CONFIG.JUMP_FORCE;
+                    player.onGround = false;
+                }
+                
+                // Apply gravity
+                player.velY -= CONFIG.GRAVITY;
+                player.y += player.velY;
+                
+                // Ground collision
+                if (player.y <= 0) {
+                    player.y = 0;
+                    player.velY = 0;
+                    player.onGround = true;
+                }
+                
+                // Update camera position
+                this.controls.getObject().position.set(player.x, player.y + CONFIG.CAMERA_HEIGHT, player.z);
+                
+                // Update player light
+                this.playerLight.position.set(player.x, player.y + CONFIG.CAMERA_HEIGHT, player.z);
+                
+                // Update chunks
+                this.updateChunks();
+            }
+            
+            animate() {
+                requestAnimationFrame(() => this.animate());
+                
+                this.updatePlayer();
+                this.renderer.render(this.scene, this.camera);
+            }
+        }
+        
+        // ==================== START GAME ====================
+        const game = new Game();
+    </script>
+</body>
+</html>
